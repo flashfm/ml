@@ -1,0 +1,5 @@
+{
+  "name": "Python Dev Container",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "python -m pip install --upgrade pip && pip install -r requirements.txt"
+}

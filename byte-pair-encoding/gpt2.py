@@ -5,6 +5,7 @@
 import bpe
 import requests, os, json
 import regex as re
+from pathlib import Path
 
 def bytes_to_unicode():
     """
@@ -33,7 +34,7 @@ def encode_with_pat(text, merges, encoder):
   ids = []
   for s in re.findall(pat, text):
     tokens = [encoder[byte_encoder[b]] for b in s.encode("utf-8")]
-    ids.extend(encode(tokens, merges))
+    ids.extend(bpe.encode(tokens, merges))
   return ids
 
 def convert_bpe_merges(bpe_merges, encoder):
@@ -61,15 +62,21 @@ def getfile(filename, url, is_json = False):
 
   return result
 
-encoder = getfile("/content/encoder.json", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/encoder.json", is_json = True)
+app_dir = Path.home() / ".gpt2-py"
+app_dir.mkdir(exist_ok = True)
 
-bpe_data = getfile("/content/vocab.bpe", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/vocab.bpe")
+encoder = getfile(app_dir / "encoder.json", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/encoder.json", is_json = True)
+
+bpe_data = getfile(app_dir / "vocab.bpe", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/vocab.bpe")
 bpe_merges = [tuple(merge_str.split()) for merge_str in bpe_data.split('\n')[1:-1]]
 
 merges = convert_bpe_merges(bpe_merges, encoder)
 
+validation_text = bpe.get_validation_text()
 ids = encode_with_pat(validation_text, merges, encoder)
 
-print(len(ids))
+print("Validation text:")
+print(validation_text)
+print(len(ids), "tokens")
 print(ids)
 print("Now compare it to Tiktoken app: https://tiktokenizer.vercel.app/?model=gpt2")

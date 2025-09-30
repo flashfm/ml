@@ -109,37 +109,36 @@ def decode(ids, vocab):
     decompressed += vocab[n]
   return bytearray(decompressed).decode("utf-8", errors = "replace")
 
+def get_validation_text():
+  return """‘Heavens! what a virulent attack!’ replied the prince,
+not in the least disconcerted by this reception. He had just
+entered, wearing an embroidered court uniform, knee
+breeches, and shoes, and had stars on his breast and a
+serene expression on his flat face. He spoke in that refined
+French in which our grandfathers not only spoke but
+thought, and with the gentle, patronizing intonation
+natural to a man of importance who had grown old in
+society and at court. He went up to Anna Pavlovna, kissed
+her hand, presenting to her his bald, scented, and shining
+head, and complacently seated himself on the sofa."""
+
 def bpe_test():
   # First train our "merges" using the following text.
 
-  train_text = """
-  It was in July, 1805, and the speaker was the wellknown Anna Pavlovna Scherer, maid of honor and
-  favorite of the Empress Marya Fedorovna. With these
-  words she greeted Prince Vasili Kuragin, a man of high
-  rank and importance, who was the first to arrive at her
-  reception. Anna Pavlovna had had a cough for some days.
-  She was, as she said, suffering from la grippe; grippe
-  being then a new word in St. Petersburg, used only by the
-  elite.
-  """
+  train_text = """It was in July, 1805, and the speaker was the wellknown Anna Pavlovna Scherer, maid of honor and
+favorite of the Empress Marya Fedorovna. With these
+words she greeted Prince Vasili Kuragin, a man of high
+rank and importance, who was the first to arrive at her
+reception. Anna Pavlovna had had a cough for some days.
+She was, as she said, suffering from la grippe; grippe
+being then a new word in St. Petersburg, used only by the
+elite."""
   tokens = unicode_to_ids(train_text)
   _, merges = train(tokens, 276)
 
   # Now let's encode some other text using those "merges" mapping.
 
-  validation_text = """
-  ‘Heavens! what a virulent attack!’ replied the prince,
-  not in the least disconcerted by this reception. He had just
-  entered, wearing an embroidered court uniform, knee
-  breeches, and shoes, and had stars on his breast and a
-  serene expression on his flat face. He spoke in that refined
-  French in which our grandfathers not only spoke but
-  thought, and with the gentle, patronizing intonation
-  natural to a man of importance who had grown old in
-  society and at court. He went up to Anna Pavlovna, kissed
-  her hand, presenting to her his bald, scented, and shining
-  head, and complacently seated himself on the sofa.
-  """
+  validation_text = get_validation_text()
   ids = encode(unicode_to_ids(validation_text), merges)
 
   # Decode and test that it equals to the original
@@ -148,4 +147,5 @@ def bpe_test():
   text2 = decode(ids, vocab)
   print("Original and decoded texts are equal" if validation_text == text2 else "Error!")
 
-bpe_test()
+if __name__ == "__main__":
+  bpe_test()
