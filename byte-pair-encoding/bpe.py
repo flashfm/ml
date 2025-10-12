@@ -1,3 +1,13 @@
+# This is an example of byte-pair encoder.
+# It allows to convert a string to a list of numbers, where each number represents a small chunk of text called token.
+# It produces a numerical representation of a string which is more compressed than just unicode.
+# We start with char-to-byte unicode encoding.
+# Then we iteratively look for the most frequent pair of numbers and replace them with a new number.
+# We continue this process until there is no pairs anymore or we reach target vocabulary size.
+# Vocabulary is a mapping from a number to a pair of "previous" numbers (if you unwind it - from a number to a token).
+# The vocabulary is built during "training" process on a large text.
+# Then it can be used to encode any string by iteratively replacing number pairs that appear in the vocabulary.
+
 def get_stats(ids: list[int]):
   """
   Calculate frequences of pairs of numbers in the array.

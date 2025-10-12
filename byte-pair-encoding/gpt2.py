@@ -2,10 +2,10 @@
 # Then check GPT-2 encoder: https://github.com/openai/gpt-2.
 # This example shows how GPT-2 data structures are converted to what we had in bpe.py.
 
-import bpe
-import requests, os, json
-import regex as re
-from pathlib import Path
+import bpe, sys, os, regex
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared import get_file
 
 def bytes_to_unicode():
     """
@@ -28,11 +28,11 @@ def bytes_to_unicode():
     cs = [chr(n) for n in cs]
     return dict(zip(bs, cs))
 
-pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+pat = regex.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 def encode_with_pat(text, merges, encoder):
   ids = []
-  for s in re.findall(pat, text):
+  for s in regex.findall(pat, text):
     tokens = [encoder[byte_encoder[b]] for b in s.encode("utf-8")]
     ids.extend(bpe.encode(tokens, merges))
   return ids
@@ -48,26 +48,9 @@ def convert_bpe_merges(bpe_merges, encoder):
 byte_encoder = bytes_to_unicode()
 byte_decoder = {v:k for k, v in byte_encoder.items()}
 
-def getfile(filename, url, is_json = False):
-  if not os.path.exists(filename):
-      response = requests.get(url)
-      with open(filename, 'wb') as f:
-          f.write(response.content)
+encoder = get_file("encoder.json", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/encoder.json", is_json = True)
 
-  with open(filename, 'r', encoding='utf-8') as f:
-    if (is_json):
-      result = json.load(f)
-    else:
-      result = f.read()
-
-  return result
-
-app_dir = Path.home() / ".gpt2-py"
-app_dir.mkdir(exist_ok = True)
-
-encoder = getfile(app_dir / "encoder.json", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/encoder.json", is_json = True)
-
-bpe_data = getfile(app_dir / "vocab.bpe", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/vocab.bpe")
+bpe_data = get_file("vocab.bpe", "https://openaipublic.blob.core.windows.net/gpt-2/models/1558M/vocab.bpe")
 bpe_merges = [tuple(merge_str.split()) for merge_str in bpe_data.split('\n')[1:-1]]
 
 merges = convert_bpe_merges(bpe_merges, encoder)
