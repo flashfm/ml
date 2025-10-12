@@ -30,10 +30,10 @@ def create_training_set(words):
             ys.append(ix2)
     return torch.tensor(xs), torch.tensor(ys)
 
-xs, ys = create_training_set(words[:1])
+xs, ys = create_training_set(words)
 
 num = xs.nelement()
-print(f"number of examples: ", num)
+print("number of examples:", num)
 
 # Initialize the neural network
 
@@ -83,29 +83,65 @@ for k in range(100):
 
   # Calculate loss (average negative log likelyhood)
 
-  # for-loop form
+  # For-loop form, we won't use it since it is slow.
   # nlls = torch.zeros(num)
   # for i in range(num):
   #   x = xs[i].item()
   #   y = ys[i].item()
-  #   p = probs[i, y] # probs[i] is probabilities for all chars, so probs[i, y] is probability assigned to y
+  #   print(f'bigram example {i+1}: {itos[x]}{itos[y]} (indexes {x}, {y})')
+  #   print('input to the neural net:', x)
+  #   print('output probabilities from the neural net:', probs[i])
+  #   print('label (actual next character):', y)
+  #   # probs[i] is probabilities for all chars, so probs[i, y] is probability assigned to y
+  #   p = probs[i, y]
   #   nll = -torch.log(p)
   #   nlls[i] = nll
+  # # average negative log likelyhood is loss
   # loss = nlls.mean().item()
 
-  # tensor form
-  loss = -probs[torch.arange(num), ys].log().mean()
-  
-  # Example:
+  # Tensor form.
   # torch.arange(5) = [0, 1, 2, 3, 4]
+  loss = -probs[torch.arange(num), ys].log().mean()
 
-  print(loss.item())
+  # Regularization.
+  # That prevents having some W values too small and some too large. Aka smoothing the probabilities.
+  # If we incentivize W values to be around zero, then distribution would be more smooth.
+  # It's like we did (N+1) in stats.py.
+  # If we would add 1_000_000, then all probabilities would be equal (since values of N are much smaller) - this is super-smooth.
+  # We convert W values to all positives via ^2, then take average to have it small (if we'd take sum() it would be too large).
+  # Example: (W**2).mean() can be = 2.112 on first run.
+  # We also multiply by "regularization strength" equals 0.01.
+  # If W values are far from 0, then loss increases and the net will try to make it smaller next time.
+  # If we would choose "regularization strength" too big, it would overweight the first part of "loss",
+  # so the optimization would be too focused on making W small, not by having probabilities follow examples.
+  loss += 0.01 * (W**2).mean()
+
+  print("loss:", loss.item())
 
   # backward pass
 
-  W.grad = None # set gradient to 0
+  # set gradient to 0
+  W.grad = None
   loss.backward()
 
-  # update weights
-
+  # Update weights
+  # Learning rage is big but it works fine on this small model.
   W.data += -50 * W.grad
+
+# At the end we should have W values similar to what we had in P in stats.py
+# That's because one-hot vector multiplied by W should give one row of W, and that's the same like we had in P.
+
+# Let's sample
+for i in range(5):
+    out = []
+    ix = 0
+    while True:
+        xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
+        logits = xenc @ W
+        counts = logits.exp()
+        p = counts / counts.sum(1, keepdim=True)
+        ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
+        out.append(itos[ix])
+        if ix==0:
+            break
+    print(''.join(out))
