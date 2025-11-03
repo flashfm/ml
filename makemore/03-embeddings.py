@@ -1,5 +1,6 @@
 # Check stats.py and neural.py first.
 # Same problem, but instead of bi-grams like in neural.py, we introduce embeddings matrix and "context"
+# Based on "A Neural Probabilistic Language Model" paper by Bengio, Ducharme, Vincent and Jauvin.
 
 import torch, torch.nn.functional as F, matplotlib.pyplot as plt, random
 from mmshared import *
@@ -58,7 +59,7 @@ Xte, Yte = build_dataset(words[n2:])
 # Tip: take N = 2 at the beginning. We use 10 here by the reasons described at the end.
 # So let's have C as tensor with 27 rows and N columns. Each row for every character, and row is N-dimensional vector.
 C_size = 10 # 2 in the beginning
-C = torch.randn((27, C_size))
+C = torch.randn((27, C_size), generator=g)
 
 # Note:
 # We previously represented each of 27 chars as 1-hot vectors [0, ..., 1, ..., 0, ...0]
@@ -83,8 +84,8 @@ C = torch.randn((27, C_size))
 
 W1_input_size = C_size * block_size # C_size is dimension of embedding matrix; block_size is length of input sample
 W1_size = 200 # number of neurons in this layer (100 originally)
-W1 = torch.randn((W1_input_size, W1_size))
-b1 = torch.randn(W1_size) # biases
+W1 = torch.randn((W1_input_size, W1_size), generator=g)
+b1 = torch.randn(W1_size, generator=g) # biases
 
 # "emb @ W1 + b1" won't work since the emp.shape = [M, 3, 2], where M is number of input examples
 # emb[:, 0, :].shape is [M, 2]
@@ -113,8 +114,8 @@ b1 = torch.randn(W1_size) # biases
 # Is addition work correctly?
 # Torch will broadcast [32,100] to [100] by converting [100] into [1,100] and then copying vertically to all 32 rows and adding them
 
-W2 = torch.randn((W1_size, 27))
-b2 = torch.randn(27)
+W2 = torch.randn((W1_size, 27), generator=g)
+b2 = torch.randn(27, generator=g)
 
 parameters = [C, W1, b1, W2, b2]
 
@@ -178,7 +179,7 @@ for i in range(steps):
     # torch.randint(0, 5, (32,)) returns vector of 32 numbers from 0 to 4
     # 32 is our mini-batch size
 
-    ix = torch.randint(0, Xtr.shape[0], (32,))
+    ix = torch.randint(0, Xtr.shape[0], (32,), generator=g)
     X_batch = Xtr[ix]
     Y_batch = Ytr[ix]
 

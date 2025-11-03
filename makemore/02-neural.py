@@ -1,5 +1,5 @@
 # Check stats.py first.
-# Same problem, but we'll use a neural network instead of just statistics
+# Same problem, but we'll use a neural network instead of just statistics.
 
 import torch, torch.nn.functional as F, matplotlib.pyplot as plt
 from mmshared import *
