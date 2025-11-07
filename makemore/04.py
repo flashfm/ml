@@ -3,8 +3,9 @@
 import torch, torch.nn.functional as F, matplotlib.pyplot as plt, random
 from mmshared import *
 
-# region This is almost a copy of embeddings.py
+# This file was a copy of embeddings.py and then got improvements on initialization, batch normalization, etc. (see at the end).
 
+eps = 1e-5
 g = torch.Generator().manual_seed(2147483647)
 random.seed(42)
 
@@ -38,16 +39,18 @@ n_hidden = 200
 # Why those tensors have multiplies like 0, 0.01 or 0.2? See at the end
 
 C = torch.randn((vocab_size, n_embed), generator=g)
-W1 = torch.randn((n_embed * block_size, n_hidden), generator=g) * 0.3 # Why 0.3 - see at the end
-b1 = torch.randn(n_hidden, generator=g) * 0.01
+W1 = torch.randn((n_embed * block_size, n_hidden), generator=g) * 0.3 # Why 0.3 - see at the end 
+# b1 = torch.randn(n_hidden, generator=g) * 0.01   # this bias is not used because batch norm subtract it always
 W2 = torch.randn((n_hidden, vocab_size), generator=g) * 0.01
 b2 = torch.randn(vocab_size, generator=g) * 0
 
 # See at the end why we added those
 bngain = torch.ones((1, n_hidden))
 bnbias = torch.zeros((1, n_hidden))
+bnmean_running = torch.zeros((1, n_hidden))
+bnstd_running = torch.ones((1, n_hidden))
 
-parameters = [C, W1, b1, W2, b2, bngain, bnbias]
+parameters = [C, W1, W2, b2, bngain, bnbias]
 print("Parameters:", sum(p.nelement() for p in parameters))
 for p in parameters:
     p.requires_grad = True
@@ -64,13 +67,18 @@ for i in range(max_steps):
     # forward
     emb = C[Xb]
     embcat = emb.view(emb.shape[0], -1)
-    hpreact = embcat @ W1 + b1
+    hpreact = embcat @ W1    # + b1    # bias is not added, because " - mean" later substracts it later; bnbias works instead of it
 
-    # apply batch normalization (details at the end of this program)
+    # apply batch normalization (details are at the end)
     mean = hpreact.mean(0, keepdim=True)
     std = hpreact.std(0, keepdim=True)
-    hpreact = (hpreact - mean) / std
+    hpreact = (hpreact - mean) / (std + eps) # eps is added to prevent division by 0, unlikely but anyway
     hpreact = bngain * hpreact + bnbias
+
+    # save to running mean and std, so we can use it later (details are at the end)
+    with torch.no_grad():
+        bnmean_running = 0.999 * bnmean_running + 0.001 * mean
+        bnstd_running = 0.999 * bnstd_running + 0.001 * std
 
     h = torch.tanh(hpreact)
     logits = h @ W2 + b2
@@ -105,6 +113,7 @@ for i in range(max_steps):
 # plt.plot(lossi)
 # plt.show()
 
+# Method to test different sample sets
 @torch.no_grad() # disable gradients
 def split_loss(split):
     x,y = {
@@ -114,8 +123,13 @@ def split_loss(split):
     }[split]
     emb = C[x]
     embcat = emb.view(emb.shape[0], -1)
-    hpreact = embcat @ W1 + b1
-    hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True) + bnbias # batch norm here as well
+    hpreact = embcat @ W1    # + b1       # bias is not added, because " - bnmean_running" substracts it later
+
+    # BatchNorm:
+    # hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / hpreact.std(0, keepdim=True) + bnbias
+    # Instead of this ^ we remove dependency from other samples and use values calculated during training
+    hpreact = bngain * (hpreact - bnmean_running) / bnstd_running + bnbias
+
     h = torch.tanh(hpreact)
     logits = h @ W2 + b2
     loss = F.cross_entropy(logits, y)
@@ -138,8 +152,6 @@ def sample():
         if ix==0:
             break
     print(''.join(itos[i] for i in out))
-
-# endregion
 
 # Let's fix initial weights, because they affect initial loss change.
 
@@ -222,7 +234,28 @@ def sample():
 # Btw, mean and std are differentiable functions, so there will be no problem with backpropagation.
 
 # However, we want model to allow some deviation, i.e. allow the distribution to be shifted a bit, to avoid keeping it 0-mean, 1-std Guassian always.
-# So we introduce some "gain" and "shift" (bias) to be learned and modify the hpreact.
+# So we introduce some "gain" and "shift" (bias) to be learned during training and modify the hpreact.
 # That's why we introduced bngain (all ones) and bnbias (all zeros) at the code above.
 
 # Batch normalization allows to think less about what "scale" multiplier should W1, W2, and so on have.
+
+# However, in the split_loss() we have 1 example and we want to get a next symbol for it.
+# How to solve a problem that BatchNorm needs mean and std of a batch? We don't have such batch.
+# So we calculate mean and std over the whole training set (Xtr) and use it:
+#
+# @torch.no_grad() # disable gradients
+# def get_xtr_stat():
+#     emb = C[Xtr]
+#     embcat = emb.view(emb.shape[0], -1)
+#     hpreact = embcat @ W1 + b1
+#     bnmean = hpreact.mean(0, keepdim=True)
+#     bnstd = hpreact.std(0, keepdim=True)
+#     return bnmean, bnstd
+#
+# However, usually those numbers are calculated as "running mean" and "running std" during training.
+# That's how bnmean_running and bnstd_running appears (see how they are updated during training).
+
+# Also note, that b1 will be subtracted when we subtract mean, so we remove b1 completely.
+# It is replaced with bias of batch normalization (see gain and shift above).
+
+# Batch norm is normally used after matrix multiplications.
