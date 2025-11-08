@@ -15,22 +15,11 @@ random.shuffle(words)
 stoi, itos = get_dictionaries(words)
 block_size = 3
 
-def build_dataset(words):
-    X, Y = [], []
-    for w in words:
-        context = [0] * block_size
-        for ch in w + '.':
-            ix = stoi[ch]
-            X.append(context)
-            Y.append(ix)
-            context = context[1:] + [ix]
-    return torch.tensor(X), torch.tensor(Y)
-
 n1 = int(0.8 * len(words))
 n2 = int(0.9 * len(words))
-Xtr, Ytr = build_dataset(words[:n1])
-Xdev, Ydev = build_dataset(words[n1:n2])
-Xte, Yte = build_dataset(words[n2:])
+Xtr, Ytr = build_dataset(words[:n1], block_size, stoi)
+Xdev, Ydev = build_dataset(words[n1:n2], block_size, stoi)
+Xte, Yte = build_dataset(words[n2:], block_size, stoi)
 
 vocab_size = len(itos)
 n_embed = 10
@@ -258,4 +247,5 @@ def sample():
 # Also note, that b1 will be subtracted when we subtract mean, so we remove b1 completely.
 # It is replaced with bias of batch normalization (see gain and shift above).
 
-# Batch norm is normally used after matrix multiplications.
+# Batch norm is normally used after matrix multiplications and before non-linear layer.
+# Same architecture is used by ResNet (residual network) for image classification.
