@@ -85,7 +85,8 @@ for t in [logprobs, probs, counts_sum_inv, counts_sum, counts, norm_logits, logi
     t.retain_grad()
 loss.backward()
 
-# Our own backward pass!
+# Let's create our own backward pass!
+# We'll compare it to PyTorch.
 
 # Chain rule:
 # If we have a chain: x → u → v → y, where u = f(x), v = g(u), y = h(v)
@@ -218,5 +219,105 @@ dbndiff2 = 1/(n-1) * torch.ones_like(bndiff2) * dbnvar
 
 cmp('bndiff2', dbndiff2, bndiff2)
 
+dbndiff += 2 * bndiff * dbndiff2
+
 cmp('bndiff', dbndiff, bndiff)
 
+# emb = C[Xb]
+# embcat = emb.view(emb.shape[0], -1)
+
+dhprebn = dbndiff.clone()
+
+# `bndiff = hprebn - bnmeani` - broadcasting here, so need sum
+dbnmeani = -dbndiff.sum(0, keepdim=True)
+
+cmp('bnmeani', dbnmeani, bnmeani)
+
+dhprebn += 1/n * torch.ones_like(hprebn) * dbnmeani
+
+cmp('hprebn', dhprebn, hprebn)
+
+dembcat = dhprebn @ W1.T
+
+cmp('embcat', dembcat, embcat)
+
+dW1 = embcat.T @ dhprebn
+
+cmp('W1', dW1, W1)
+
+db1 = dhprebn.sum(0)
+
+#cmp('b1', db1, b1)
+
+demb = dembcat.view(emb.shape)
+
+cmp('emb', demb, emb)
+
+# emb = C[Xb] - plucking out rows, have to use for-loop to get back to propagate gradient
+dC = torch.zeros_like(C)
+for k in range(Xb.shape[0]):
+    for j in range(Xb.shape[1]):
+        ix = Xb[k,j]
+        dC[ix] += demb[k,j]
+
+cmp('C', dC, C)
+
+######
+# We can simplify loss calculation and so make gradients calculation more efficient.
+
+# loss = -log Py
+# Pi = e^Li / sum(e^Lj)
+# dloss / dLi = d/dLi (-log e^Li...)
+
+# Do calculation on paper...
+# dloss / dLi = ... = if i!=y then Pi, otherwise Pi-1
+
+###
+# Let's start with dlogits:
+
+dlogits = F.softmax(logits, 1)
+dlogits[range(n), Yb] -= 1
+dlogits /= n
+
+cmp('logits', dlogits, logits)
+
+# Let's visualize first row of logits and dlogits
+print("logits: ", F.softmax(logits, 1)[0])
+
+# Note the -0.96 value: it is ~1 and all other values are ~0
+print("dlogits:", dlogits[0] * n)
+
+# Sum of graditents is 0
+print("dlogits sum", dlogits[0].sum())
+
+# So dlogits pulls "correct" value up and "wrong" values down.
+
+# Also for all examples:
+# plt.figure(figsize=(8,8))
+# plt.imshow(dlogits.detach(), cmap='gray')
+# plt.show()
+
+###
+# Now, lets calculate hpreact more efficiently:
+
+# forward pass
+# bnmeani = 1/n * hprebn.sum(0, keepdim=True) # mean
+# bndiff = hprebn - bnmeani
+# bndiff2 = bndiff**2
+# bnvar = 1/(n-1) * bndiff2.sum(0, keepdim=True) # it's `1/n * ...` in the paper for training and `1/(n-1)` (Bessel's correction) for inference, we use Bessel's corr. always
+# bnvar_inv = (bnvar + 1e-5)**-0.5
+# bnraw = bndiff * bnvar_inv
+# hpreact = bngain * bnraw + bnbias
+
+hpreact_fast = bngain * ((hprebn - hprebn.mean(0, keepdim=True)) / torch.sqrt((hprebn.var(0, keepdim=True, unbiased=True) + 1e-5))) + bnbias
+
+print("hpreact_fast max diff: ", (hpreact - hpreact_fast).abs().max())
+
+# backward pass
+# let's calculate dhprebn (given dhpreact)
+# Use paper "Batch normalization: accelerating deep network training by reducing internal covariate shift" by Sergey Ioffe at al
+# to get formulas of mu, sigma-squared, X-Ith with hat, Mu-Ith etc. and calculate derivatives on paper.
+
+dhprebn = bngain * bnvar_inv / n * (n * dhpreact - dhpreact.sum(0) - n/(n-1) * bnraw * (dhpreact * bnraw).sum(0))
+
+cmp('hprebn', dhprebn, hprebn)
