@@ -321,3 +321,7 @@ print("hpreact_fast max diff: ", (hpreact - hpreact_fast).abs().max())
 dhprebn = bngain * bnvar_inv / n * (n * dhpreact - dhpreact.sum(0) - n/(n-1) * bnraw * (dhpreact * bnraw).sum(0))
 
 cmp('hprebn', dhprebn, hprebn)
+
+# Now we can use those derivatives to update the values instead of calling loss.backward():
+# for p, grad in zip(parameters, grads):
+#   p.data += -lr * grad
