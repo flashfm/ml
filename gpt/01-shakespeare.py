@@ -34,14 +34,35 @@ train_data = data[:n]
 val_data = data[n:]
 
 # hyperparameters
-block_size = 8
-batch_size = 32
-max_iters = 5000
-eval_interval = 300 # nubmer of steps to do before printing progress
-learning_rate = 1e-3
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
-eval_iters = 200 # number batches to do model evaluation for every "print progress" stop
-n_embd = 32 # embedding size (number of trainable characteristics per char)
+
+# initial values
+
+# batch_size = 32 # batches
+# block_size = 8 # context
+# max_iters = 5000 # steps
+# eval_interval = 300 # nubmer of steps to do before printing progress
+# learning_rate = 1e-3 # LR
+# eval_iters = 200 # number batches to do model evaluation for every "print progress" stop
+# n_embd = 32 # embedding size (number of trainable characteristics per char)
+# n_head = 4 # heads in multi-headed self-attention
+# n_layer = 4 # how many Blocks we have
+# dropout = 0.2 # dropout chance
+
+# final values
+
+batch_size = 64
+block_size = 256
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
+eval_iters = 200
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+
 # ----
 print("Device:", device)
 
@@ -326,9 +347,19 @@ out = wei @ v
 ####
 
 # Improving the model:
-# - Create Head module
 # - Changing embedding size and adding a linear layer after embedding layer
 # - Add anoter embedding table to account for positions
+# - Add Head module
+# - Add MultiHeadAttention
+# - Add FeedForward after self-attention, it should have 4 times more channels
+# - Add Block (combination of attention (communication) and feed forward (computation))
+# - Add residual connection - it allows backpropagation to split gradient and go futher up to the input, because residual uses addition
+# - Add "projection" to MultiHeadAttention after heads and to FeedForward, it is going back into the residual pathway
+# - Add LayerNorm - this is the same as BatchNorm1d, but normalizing on direction of rows (not columns)
+# - Deviation from original paper - use LayerNorm before self-attention block, not after
+# - Put number of blocks and head size to hyperparameters
+# - Add DropOut to FeedForward block, multi-head attention and single head (wei)
+# - Increase all hyperparameter values
 
 class Head(nn.Module):
     # one head of self-attention
@@ -342,6 +373,8 @@ class Head(nn.Module):
         # not a model parameter, so we save it as "buffer"
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x)   # (B, T, C)
@@ -349,6 +382,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5      # (B, T, C) @ (B, C, T) ---> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B, T, T) @ (B,T,C) ---> (B,T,C)
         return out
@@ -361,10 +395,69 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd) # projection
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out =  torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
 
+class FeedForward(nn.Module):
+    # linear + non-linear
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd), # this is projection too,
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+class Block(nn.Module):
+
+    # Transformer block: communication + computation
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+
+        # Note: since size is n_embd, Layer norm is treating batch and time as batch dimensions both, applying just to 32 numbers (features), i.e. per-token
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))        # "x = x + ..." means residual connection
+        x = x + self.ffwd(self.ln2(x))      # in orignal paper LN applied to the result of sa and ffwd, but we do it before
+        return x
+
+# Copy of BatchNorm1d, but taking mean() over rows, not columns - it normalizes rows.
+# So differentiation training/inference, running_mean and running_var are not needed.
+# We will use nn.LayerNorm actually, this is for information only.
+
+class LayerNorm:
+     
+    def __init__(self, dim, eps = 1e-5, momentum = 0.1): 
+        self.eps = eps
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+
+    def __call__(self, x):
+        # forward pass
+        xmean = x.mean(1, keepdim=True) # batch mean
+        xvar = x.var(1, keepdim=True, unbiased=True) # batch variance
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)
+        self.out = self.gamma * xhat + self.beta
+        return self.out
+    
+    def parameters(self):
+        return [self.gamma, self.beta]
 
 class BigramLanguageModel2(nn.Module):
 
@@ -372,7 +465,8 @@ class BigramLanguageModel2(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_heads = MultiHeadAttention(4, n_embd//4)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets = None):
@@ -389,7 +483,9 @@ class BigramLanguageModel2(nn.Module):
 
         x = tok_emb + pos_emb # broadcasting here: (B, T, C) + (T, C) -> (B, T, C)
 
-        x = self.sa_heads(x)
+        x = self.blocks(x) # (B,T,C)
+
+        x = self.ln_f(x)
 
         logits = self.lm_head(x) # (B, T, vocab_size)
 
@@ -406,5 +502,6 @@ class BigramLanguageModel2(nn.Module):
     
 model = BigramLanguageModel2(vocab_size)
 m = model.to(device)
+print("Parameters:", sum(p.numel() for p in m.parameters())/1e6, "M")
 train(m)
 generate_sample(m, 500)
