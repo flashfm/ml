@@ -2,3 +2,4 @@ requests
 regex
 torch
 matplotlib
+transformers[torch]

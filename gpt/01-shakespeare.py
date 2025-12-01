@@ -1,4 +1,4 @@
-# First check "makemore"
+# First check "makemore" to understand basics.
 
 # Based on "Attention is all you need" paper.
 
