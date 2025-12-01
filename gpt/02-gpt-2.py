@@ -12,7 +12,10 @@
 from transformers import GPT2LMHeadModel, pipeline, set_seed
 from dataclasses import dataclass
 from torch.nn import functional as F
-import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken, math
+import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken, math, sys, os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared import get_file
 
 # First let's try HuggingFace implementation and weights of actual GPT-2 and generate some text
 
@@ -42,6 +45,8 @@ def try_huggingface():
     set_seed(42)
     g = generator("Hello, I'm a language model,", max_length=30, num_return_sequences=5, truncation=True)
     print(g)
+
+# try_huggingface()
 
 # Let's now reproduce GPT-2 ourselves.
 # GPT-2 does not have encoder part and cross-attention part in the decoder block.
@@ -95,7 +100,6 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-
 class MLP(nn.Module):
 
     def __init__(self, config: GPTConfig):
@@ -143,7 +147,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     # Forward is needed for generation from the model
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size
 
@@ -159,7 +163,13 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         # Classifier (Linear)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:            
+            # view(...) transforms (B, T, vocab_size) to (B*T, vocab_size)
+            logits_2d = logits.view(-1, logits.size(-1))
+            targets_column = targets.view(-1)
+            loss = F.cross_entropy(logits_2d, targets_column)
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -207,50 +217,87 @@ class GPT(nn.Module):
 
         return model
 
-model = GPT.from_pretrained("gpt2")
-
-num_return_sequences = 5
-max_length = 30
-
-# Switch to evaluation mode.
-# We don't have Batch Norm or others which differ in train/eval mode, but anyway.
-model.eval()
-
-# Switch to CUDA.
-#device = "cuda"
+# Switch to CUDA if possible
 device = "cpu"
-model.to(device)
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print("Device:", device)
 
 # Let's generate!
 # We use Tiktoken tokenizer to get tokens from string and back.
 
+num_return_sequences = 5
+max_length = 30
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,") # 8 integers
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
-
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        logits = logits[:,-1,:] # last (B, vocab_size)
-        probs = F.softmax(logits, dim=-1)
-        # Top-k sampling of 50 (Huggingface default)
-        # This means that we sort probs and everything over 50th is replaced to 0, then normalized again
-        # This way we have no chance to sample very rare tokens.
-        # topk_probs and topk_indices are (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from top-k probabilities
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # ?
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        x = torch.cat((x, xcol), dim=1)
+def create_prompt(msg):
+    tokens = enc.encode(msg) # 8 integers
+    tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+    x = tokens.to(device)
+    return x
 
-# print
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+def generate(model, x):
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x) # (B, T, vocab_size)
+            logits = logits[:,-1,:] # last (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)
+            # Top-k sampling of 50 (Huggingface default)
+            # This means that we sort probs and everything over 50th is replaced to 0, then normalized again
+            # This way we have no chance to sample very rare tokens.
+            # topk_probs and topk_indices are (5, 50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            # select a token from top-k probabilities
+            ix = torch.multinomial(topk_probs, 1) # (B, 1)
+            # ?
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            x = torch.cat((x, xcol), dim=1)
+    return x
+
+def print_sample(x):
+    B = x.size(0)
+    for i in range(B):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+# Let's load weights and generate
+
+def load_and_generate():
+    x = create_prompt("Hello, I'm a language model,")
+    model = GPT.from_pretrained("gpt2")
+    # Switch to evaluation mode.
+    # We don't have Batch Norm or others which differ in train/eval mode, but anyway.
+    model.eval()
+    model.to(device)
+    x = generate(model, x)
+    print_sample(x)
+
+# load_and_generate()
+
+# Now, let's train an empty model on shakespeare dataset
+
+model = GPT(GPTConfig())
+
+text = get_file("shakespeare.txt", "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
+data = text[:1000]
+tokens = enc.encode(data)
+
+# From set of tokens, create batched inputs X and labels Y
+
+def create_training_batch():
+    B,T = 4,32
+    buf = torch.tensor(tokens[:B*T + 1])  # +1 so we can create Y as labels
+    # View as 2D creates batch rows
+    x = buf[:-1].view(B,T)
+    y = buf[1:].view(B,T)
+    return x,y
+
+x,y = create_training_batch()
+logits, loss = model(x, y)
+print(loss)
