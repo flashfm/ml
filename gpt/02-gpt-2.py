@@ -12,8 +12,7 @@
 from transformers import GPT2LMHeadModel, pipeline, set_seed
 from dataclasses import dataclass
 from torch.nn import functional as F
-import matplotlib.pyplot as plt, torch, torch.nn as nn
-
+import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken
 
 # First let's try HuggingFace implementation and weights of actual GPT-2 and generate some text
 
@@ -142,6 +141,25 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    # Forward is needed for generation from the model
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size
+
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # positions, (T)
+        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        # Final LayerNorm
+        x = self.transformer.ln_f(x)
+        # Classifier (Linear)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
@@ -189,3 +207,13 @@ class GPT(nn.Module):
         return model
 
 model = GPT.from_pretrained("gpt2")
+
+num_return_sequences = 5
+max_length = 30
+
+# Switch to evaluation mode.
+# We don't have Batch Norm or others which differ in train/eval mode, but anyway.
+model.eval()
+
+# Switch to CUDA.
+# model.to("cuda")
