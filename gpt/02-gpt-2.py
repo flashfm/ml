@@ -13,7 +13,9 @@
 from transformers import GPT2LMHeadModel, pipeline, set_seed
 from dataclasses import dataclass
 from torch.nn import functional as F
-import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken, math, sys, os, time, inspect
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken, math, sys, os, time, inspect, torch.distributed as dist
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared import get_file
@@ -296,17 +298,28 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-
-# Switch to CUDA if possible
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print("Device:", device)
-
-# Let's generate!
-# We use Tiktoken tokenizer to get tokens from string and back.
+# sets up Distributed Data Parallel
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "CUDA or MPS is required to use DDP"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.mps.is_available():
+        device = "mps"
+    print("device:", device)
 
 num_return_sequences = 5
 max_length = 30
@@ -372,10 +385,14 @@ model.to(device)
 # b) reduces GPU read/write - decreases memory movements between GPU and GPU's mem (HBM) - also called "kernel fusion" - do more on GPU without moving to HBM
 model = torch.compile(model)
 
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model
+
 text = get_file("shakespeare.txt", "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
 
 # From set of tokens, create batched inputs X and labels Y
-
 def create_training_batch(tokens):
     B,T = 4,32
     buf = torch.tensor(tokens[:B*T + 1])  # +1 so we can create Y as labels
@@ -407,9 +424,11 @@ def optimize_single_batch(x, y):
 
 class DataLoader:
 
-    def __init__(self, text, B, T):
+    def __init__(self, text, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
@@ -418,7 +437,8 @@ class DataLoader:
         print(f"tokens: {l}")
         print(f"1 epoch = {l // (B*T)} batches")
 
-        self.current_position = 0
+        self.init_position = B * T * process_rank
+        self.current_position = self.init_position
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -426,15 +446,24 @@ class DataLoader:
         x = buf[:-1].view(B,T)
         y = buf[1:].view(B,T)
 
-        self.current_position += B*T
+        self.current_position += B * T * self.num_processes
 
         # if next batch out of bounds - reset
-        if self.current_position + (B*T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + ( B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.init_position
         
         return x,y
 
-train_loader = DataLoader(text, B=16, T=1024)
+total_batch_size = 524288 # 2**19, ~ 0.5M, in number of tokens
+B = 16 # micro batch size, increase on big GPU
+T = 1024 # context size
+assert total_batch_size % (B * T * ddp_world_size) == 0, "ensure total_batch_size is divisible by B*T*ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # see Gradient accumulation below
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoader(text, B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 # with the default float32 numbers in matrices GPU does multiplication with highest precision
 # we are ok to decrease precision to increase speed
@@ -443,12 +472,6 @@ train_loader = DataLoader(text, B=16, T=1024)
 # if available, we will have 8x speed up.
 # this is only for multiplications in GPU, for other places we use autocast() later below
 torch.set_float32_matmul_precision("high")
-
-def gpu_sync():
-    if (device == "cuda"):
-        torch.cuda.synchronize()
-    elif (device == "mps"):
-        torch.mps.synchronize()
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -468,26 +491,50 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff should start at 1 and go to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+def gpu_sync():
+    if (device == "cuda"):
+        torch.cuda.synchronize()
+    elif (device == "mps"):
+        torch.mps.synchronize()
+
 def optimize():
     #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-    optimizer = model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
+    optimizer = raw_model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
     for step in range(max_steps):
         t0 = time.time()
-
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
 
-        # use autocasting of logits to bfloat16 (bf16)
-        # important: not float16, otherwise we will need to use "gradient scaler", which makes code more complex
-        # weights are still float32, so overall it is called "mixed precision" - some parts are bfloat16, anothers float32
-        if device=="cuda":
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                _, loss = model(x, y)
-        else:
-                _, loss = model(x, y)
+        # this for-loop added for "gradient accumulation", so we can sequentially process large batches
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
 
-        loss.backward()
+            # use autocasting of logits to bfloat16 (bf16)
+            # important: not float16, otherwise we will need to use "gradient scaler", which makes code more complex
+            # weights are still float32, so overall it is called "mixed precision" - some parts are bfloat16, anothers float32
+            if device=="cuda":
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+            else:
+                    _, loss = model(x, y)
+
+            # we need to scale loss, because cross-entopy loss has a "mean" (avg) in it, i.e. it multiplies a sum by 1/batch_size
+            # we want to compensate for that since have a really large batch, but do small batches
+
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+
+            # if we are using DDP, we want to let it calculate average grads and communicate it to all processes only at last step
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+
+            loss.backward()
+
+        if ddp:
+            # since DDP averages gradients, we want to average loss as well to print it later on rank0
+            # dist.all_reduce() gets average from all ranks and deposits it back to all ranks (like with gradient)
+            dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG)
 
         # clipping the grad vector norm (aka length) to 1.0 - reason: see below in optimizations
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -503,12 +550,16 @@ def optimize():
         gpu_sync()
         t1 = time.time()
         dt = t1 - t0
-        tokens_processed = train_loader.B * train_loader.T
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_second = tokens_processed / dt
 
-        print(f"step {i:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_second:.2f}")
+        if master_process:
+            print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_second:.2f}")
 
 optimize()
+
+if ddp:
+    destroy_process_group()
 
 # no compilation, with B=16, T=1024, on Macbook: step 0, loss: 10.935505867004395, dt: 46111.53ms, tok/sec: 355.31
 
@@ -535,15 +586,23 @@ optimize()
 # FlashAttention is kernel fusion operation. It uses more FLOPs but due to reduced use of HBM provides ~7x speedup.
 # on Macbook: much slower: dt: 97925.31ms, tok/sec: 167.31 - not clear why, had to disable
 
-# 5. Fixing sizes to be powers of 2.
+# 5. Fix sizes to be powers of 2.
 # E.g. default vocab_size was 50257, but we overridden it to nearest divisable to 128 number: 50304
 # Expected improvement +4%
 # on Macbook: slower
 
-# 6. 
-# GPT-3 paper: "Language Models are Few-Shot Learners"
+# 6. GPT-3 paper: "Language Models are Few-Shot Learners"
 # - Change "betas" argument of AdamW
 # - Clip the global norm (aka length of vector) of gradient at 1.0
 # - Learning rate schedule (cosine decay with warmup)
 # - Skipped: Batch size gradual increase: from 32K tokens to full value over 4-12 B tokens of training. Skipped because it changes number of tokens per step.
 # - Add weight decay
+
+# 7. Use gradient accumulation to run any batch size on a small GPU when such large batch size does not fit into memory
+
+# 8. Use multiple GPUs in parallel: DistributedDataParallel (DDP) class, see setup_ddp() func
+# Note, when backprop is done, the DDP automatically averages gradients calculated on each of the parallel processes
+# and then sends it to every process again.
+# Since DDP is not batch-aware, we did special optimization to do so only at the end of the gradient accumulation (after grad_accum_steps steps).
+
+# 9. Use FineWeb Edu, sample 10BT dataset (10B tokens) instead of shakespeare (search for FineWeb)
