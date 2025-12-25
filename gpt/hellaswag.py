@@ -78,8 +78,10 @@ def render_example(example):
     return data, tokens, mask, label
 
 def iterate_examples(split):
-    download(split)
-    with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
+    url = hellaswags[split]
+    target = f"hellaswag_{split}.jsonl"
+    download_file(url, target)
+    with open(os.path.join(DATA_CACHE_DIR, target), "r") as f:
         for line in f:
             example = json.loads(line)
             yield example
@@ -92,7 +94,6 @@ def evaluate(model_type, device):
     # model = torch.compile(model)
 
     num_correct_norm = 0
-    num_correct = 0
     num_total = 0
     for example in iterate_examples("val"):
         data, tokens, mask, label = render_example(example)
@@ -100,30 +101,9 @@ def evaluate(model_type, device):
 
         logits = model(tokens).logits
 
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-
-        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction="none")
-
-        # get average loss for completion region (where mask == 1), in each row
-
-        # shift mask, so we start at the last prompt token
-        shift_mask = (mask[..., 1:]).contiguous() 
-        masked_shift_losses = shift_losses * shift_mask
-
-        # sum and divide by number of 1s in the mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-
-        # now we have loss for each 4 completions, one with lowest loss is most likely
-        pred = sum_loss.argmin().item()
-        pred_norm = avg_loss.argmin().item()
+        avg_loss, pred_norm = get_most_likely_row(tokens, mask, logits)
 
         num_total += 1
-        num_correct += int(pred == label)
         num_correct_norm += int(pred_norm == label)
 
         print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
@@ -135,6 +115,30 @@ def evaluate(model_type, device):
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
             print(f"predicted: {pred_norm}, actual: {label}")
+
+def get_most_likely_row(tokens, mask, logits):
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction="none")
+
+    # get average loss for completion region (where mask == 1), in each row
+
+    # shift mask, so we start at the last prompt token
+    shift_mask = (mask[..., 1:]).contiguous() 
+    masked_shift_losses = shift_losses * shift_mask
+
+    # sum and divide by number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+
+    # now we have loss for each 4 completions, one with lowest loss is most likely
+    pred_norm = avg_loss.argmin().item()
+
+    return avg_loss, pred_norm
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

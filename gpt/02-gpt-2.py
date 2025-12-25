@@ -17,10 +17,12 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import matplotlib.pyplot as plt, torch, torch.nn as nn, tiktoken, math, sys, os, time, inspect
 import torch.distributed as dist, numpy as np
+from hellaswag import iterate_examples, render_example, get_most_likely_row
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared import get_file
 
+# === PART 1 ===
 # First let's try HuggingFace implementation and weights of actual GPT-2 and generate some text
 
 def try_huggingface():
@@ -52,11 +54,15 @@ def try_huggingface():
 
 # try_huggingface()
 
-# Let's now reproduce GPT-2 ourselves.
+# === PART 2 ===
+# Create model ourselves, but load existing weights.
+
 # GPT-2 does not have encoder part and cross-attention part in the decoder block.
 # Also, in the GPT-2 paper they tell that thay changed LayerNorm layers positions comparing to original Attention paper.
 
 # Looking at the layer names in the sd_hf dictionary, reproducing the layers:
+
+# region Layers
 
 @dataclass
 class GPTConfig:
@@ -298,128 +304,10 @@ class GPT(nn.Module):
 
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
+    
+#endregion
 
-# sets up Distributed Data Parallel
-ddp = int(os.environ.get("RANK", -1)) != -1
-if ddp:
-    assert torch.cuda.is_available(), "CUDA or MPS is required to use DDP"
-    init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.mps.is_available():
-        device = "mps"
-    print("device:", device)
-
-num_return_sequences = 5
-max_length = 30
-enc = tiktoken.get_encoding("gpt2")
-torch.manual_seed(1337)
-torch.cuda.manual_seed(1337)
-
-def create_prompt(msg):
-    tokens = enc.encode(msg) # 8 integers
-    tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-    x = tokens.to(device)
-    return x
-
-def generate_pretrained(model, x):
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x) # (B, T, vocab_size)
-            logits = logits[:,-1,:] # last (B, vocab_size)
-            probs = F.softmax(logits, dim=-1)
-            # Top-k sampling of 50 (Huggingface default)
-            # This means that we sort probs and everything over 50th is replaced to 0, then normalized again
-            # This way we have no chance to sample very rare tokens.
-            # topk_probs and topk_indices are (5, 50)
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-            # select a token from top-k probabilities
-            ix = torch.multinomial(topk_probs, 1) # (B, 1)
-            # ?
-            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-            x = torch.cat((x, xcol), dim=1)
-    return x
-
-def print_sample(x):
-    B = x.size(0)
-    for i in range(B):
-        tokens = x[i, :max_length].tolist()
-        decoded = enc.decode(tokens)
-        print(">", decoded)
-
-# Let's load weights and generate
-
-def load_and_generate():
-    x = create_prompt("Hello, I'm a language model,")
-    model = GPT.from_pretrained("gpt2")
-    # Switch to evaluation mode.
-    # We don't have Batch Norm or others which differ in train/eval mode, but anyway.
-    model.eval()
-    model.to(device)
-    x = generate_pretrained(model, x)
-    print_sample(x)
-
-# load_and_generate()
-# prints samples that look like in try_huggingface(), though not exactly the same
-
-# Now, let's train an empty model on Shakespeare dataset, and then on FineWebEdu dataset
-
-model = GPT(GPTConfig(vocab_size=50304))
-model.to(device)
-
-# adds compilation time, but increases speed on GPU dramatically
-# compilation
-# a) removes Python interpreter from passes
-# b) reduces GPU read/write - decreases memory movements between GPU and GPU's mem (HBM) - also called "kernel fusion" - do more on GPU without moving to HBM
-model = torch.compile(model)
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-raw_model = model.module if ddp else model
-
-# From set of tokens, create batched inputs X and labels Y
-def create_training_batch(tokens):
-    B,T = 4,32
-    buf = torch.tensor(tokens[:B*T + 1])  # +1 so we can create Y as labels
-    buf = buf.to(device)
-    # View as 2D creates batch rows
-    x = buf[:-1].view(B,T)
-    y = buf[1:].view(B,T)
-    return x,y
-
-# x,y = create_training_batch(enc.encode(text[:1000]))
-# logits, loss = model(x, y)
-# print(loss)
-# since weights are random, should predict any token, so should be roughly ln(1/vocab_size) ~ 11
-# prints about 10.8
-
-# Let's optimize
-
-def optimize_single_batch(x, y):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    for i in range(50):
-        optimizer.zero_grad()
-        _, loss = model(x, y)
-        loss.backward()
-        optimizer.step()
-        print(f"step {i}, loss: {loss.item()}")
-
-# optimize_single_batch(x, y)
-# step 49, loss: 0.002874101046472788 - overfitting the single batch (because we have just 1 batch at this point)
+# region Data Loaders
 
 class ShakespeareDataLoader:
 
@@ -502,7 +390,140 @@ class FineWebEduDataLoader:
             self.current_position = self.init_position
         
         return x,y
-    
+
+# endregion
+
+num_return_sequences = 5
+max_length = 30
+enc = tiktoken.get_encoding("gpt2")
+torch.manual_seed(1337)
+torch.cuda.manual_seed(1337)
+
+def create_prompt(msg):
+    tokens = enc.encode(msg) # 8 integers
+    tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+    x = tokens.to(device)
+    return x
+
+def generate_pretrained(model, x):
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x) # (B, T, vocab_size)
+            logits = logits[:,-1,:] # last (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)
+            # Top-k sampling of 50 (Huggingface default)
+            # This means that we sort probs and everything over 50th is replaced to 0, then normalized again
+            # This way we have no chance to sample very rare tokens.
+            # topk_probs and topk_indices are (5, 50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            # select a token from top-k probabilities
+            ix = torch.multinomial(topk_probs, 1) # (B, 1)
+            # ?
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            x = torch.cat((x, xcol), dim=1)
+    return x
+
+def print_sample(x):
+    B = x.size(0)
+    for i in range(B):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+# Let's load weights and generate
+
+def load_and_generate():
+    x = create_prompt("Hello, I'm a language model,")
+    model = GPT.from_pretrained("gpt2")
+    # Switch to evaluation mode.
+    # We don't have Batch Norm or others which differ in train/eval mode, but anyway.
+    model.eval()
+    model.to(device)
+    x = generate_pretrained(model, x)
+    print_sample(x)
+
+# load_and_generate()
+# prints samples that look like in try_huggingface(), though not exactly the same
+
+# === PART 3 ===
+# Now, let's train an empty model on Shakespeare dataset, and then on FineWebEdu dataset
+# We first do it on 1 GPU, then switch to DDP (multiple GPUs)
+
+# sets up Distributed Data Parallel
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "CUDA or MPS is required to use DDP"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.mps.is_available():
+        device = "mps"
+    print("device:", device)
+
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+
+# adds compilation time, but increases speed on GPU dramatically
+# compilation
+# a) removes Python interpreter from passes
+# b) reduces GPU read/write - decreases memory movements between GPU and GPU's mem (HBM) - also called "kernel fusion" - do more on GPU without moving to HBM
+
+use_compile = False # temporarily disable compilation (otherwise Hellaswag eval is broken)
+if use_compile:
+    model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model
+
+# Let's optimize!
+ 
+# region First, as an example - on single batch
+
+# From set of tokens, create batched inputs X and labels Y
+# def create_training_batch(tokens):
+#     B,T = 4,32
+#     buf = torch.tensor(tokens[:B*T + 1])  # +1 so we can create Y as labels
+#     buf = buf.to(device)
+#     # View as 2D creates batch rows
+#     x = buf[:-1].view(B,T)
+#     y = buf[1:].view(B,T)
+#     return x,y
+
+# x,y = create_training_batch(enc.encode(text[:1000]))
+# logits, loss = model(x, y)
+# print(loss)
+# since weights are random, should predict any token, so should be roughly ln(1/vocab_size) ~ 11
+# prints about 10.8
+
+# def optimize_single_batch(x, y):
+#     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+#     for i in range(50):
+#         optimizer.zero_grad()
+#         _, loss = model(x, y)
+#         loss.backward()
+#         optimizer.step()
+#         print(f"step {i}, loss: {loss.item()}")
+
+# optimize_single_batch(x, y)
+# step 49, loss: 0.002874101046472788 - overfitting the single batch (because we have just 1 batch at this point)
+# endregion
+
+# Then, switch to usual batching approach.
 
 total_batch_size = 524288 # 2**19, ~ 0.5M, in number of tokens
 
@@ -547,6 +568,13 @@ torch.set_float32_matmul_precision("high")
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 
+# Setup logging
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
 # Learning rate schedule (taken from GPT-3 paper)
 def get_lr(it):
     if it < warmup_steps:
@@ -573,11 +601,15 @@ def optimize():
     optimizer = raw_model.configure_optimizer(weight_decay = 0.1, learning_rate = 6e-4, device = device)
     for step in range(max_steps):
         t0 = time.time()
+        last_step = (step == max_steps - 1)
 
-        if step%100==0:
-            validate()
+        if step % 250 == 0 or last_step:
+            evaluate(step)
 
-        if step>0 and step%100==0:
+        if (step%100==0 or last_step) and (not use_compile):
+            evaluate_hellaswag(step)
+
+        if ((step>0 and step%100==0) or last_step) and (not use_compile):
             generate()
 
         model.train()
@@ -634,13 +666,10 @@ def optimize():
 
         if master_process:
             print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_second:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
 
-optimize()
-
-if ddp:
-    destroy_process_group()
-
-def validate():
+def evaluate(step):
     model.eval()
     val_loader.reset()
     with torch.no_grad():
@@ -657,6 +686,41 @@ def validate():
         dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
     if master_process:
         print(f"validation loss: {val_loss_accum.item():.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+
+def evaluate_hellaswag(step):
+    # see 04-hellaswag.py
+    num_correct_norm = 0
+    num_total = 0
+    for i, example in enumerate(iterate_examples("val")):
+        # process only "our" examples
+        if i % ddp_world_size != ddp_rank:
+            continue
+        _, tokens, mask, label = render_example(example)
+        tokens, mask = tokens.to(device), mask.to(device)
+        with torch.no_grad():
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, _ = model(tokens)
+                _, pred_norm = get_most_likely_row(tokens, mask, logits)
+        num_total += 1
+        num_correct_norm += int(pred_norm == label)
+
+    # reduce stats across all processes
+    if ddp:
+        num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+        num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+        dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+        num_total = num_total.item()
+        num_correct_norm = num_correct_norm.item()
+
+    acc_norm = num_correct_norm / num_total
+
+    if master_process:
+        print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} hella {acc_norm:.4f}\n")
 
 def generate():
     model.eval()
@@ -682,6 +746,11 @@ def generate():
         tokens = xgen[i, :max_length].tolist()
         decoded = enc.decode(tokens)
         print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+optimize()
+
+if ddp:
+    destroy_process_group()
 
 # no compilation, with B=16, T=1024, on Macbook: step 0, loss: 10.935505867004395, dt: 46111.53ms, tok/sec: 355.31
 
