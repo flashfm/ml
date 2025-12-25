@@ -734,3 +734,7 @@ def generate():
 # 10. Add validation: validate() and val_data_loader
 
 # 11. Add some sample generation
+
+# 12. Add HellaSwag validation, store stats and validation result into files
+
+# 13. Rewrite everything in C (llm.c) - not covered here
